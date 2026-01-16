@@ -87,7 +87,7 @@ For each candidate:
 
 Rules:
 - Do NOT invent certainty.
-- If a device location hint is present, treat it as a hint only.
+- If a device location hint is present, use it to identify the location/place user is in.
 ${hints.length ? "\nHints:\n- " + hints.join("\n- ") : ""}
 `.trim();
 
