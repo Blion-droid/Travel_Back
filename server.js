@@ -253,7 +253,7 @@ Write a concise answer that feels tailored to THIS photo:
 - 3 bullet fun facts
 - 3 bullet practical visiting tips relevant to the photo context
 
-Keep it readable, well formated and Short. Be a bit crazy and unhinged, break the 4th wall.
+Keep it short. Be a bit crazy and unhinged, break the 4th wall.
 `.trim()
       : `
 You are a friendly travel guide.
