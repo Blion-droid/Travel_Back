@@ -15,18 +15,56 @@ const upload = multer({
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-app.get("/health", (_, res) => res.json({ ok: true }));
+app.get("/health", (_, res) => res.json({ ok: true, ts: Date.now() }));
 
-/**
- * POST /api/locate
- * multipart/form-data:
- *   image: file  (required, field name MUST be "image")
- *   message: string (optional)
- *   lat, lon, accuracyMeters: optional strings/numbers
- *
- * returns:
- * { candidates: [ { name, why, confidence, searchQuery }, ... x3 ] }
- */
+/* ============================================================
+   OPTION A: Server-side photoContext cache (NO app changes)
+   ============================================================ */
+
+const PHOTO_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const photoContextCache = new Map();
+
+/** best-effort key: IP + User-Agent reduces collisions */
+function cacheKeyFromReq(req) {
+  const xf = req.headers["x-forwarded-for"];
+  const ip =
+    (typeof xf === "string" ? xf.split(",")[0].trim() : null) ||
+    req.ip ||
+    "unknown";
+  const ua = (req.headers["user-agent"] || "ua:unknown").toString().slice(0, 200);
+  return `${ip}__${ua}`;
+}
+
+function setPhotoContext(req, photoContext) {
+  const key = cacheKeyFromReq(req);
+  photoContextCache.set(key, { photoContext, expiresAt: Date.now() + PHOTO_TTL_MS });
+}
+
+function getPhotoContext(req) {
+  const key = cacheKeyFromReq(req);
+  const entry = photoContextCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    photoContextCache.delete(key);
+    return null;
+  }
+  return entry.photoContext;
+}
+
+// Cleanup once/min to avoid memory growth
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of photoContextCache.entries()) {
+    if (now > v.expiresAt) photoContextCache.delete(k);
+  }
+}, 60_000);
+
+/* ============================================================
+   /api/locate
+   - Generates photoContext + candidates
+   - Caches photoContext server-side
+   - Returns ONLY candidates (so Android doesn't need changes)
+   ============================================================ */
 app.post("/api/locate", upload.single("image"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "Missing form field 'image'." });
@@ -40,19 +78,19 @@ app.post("/api/locate", upload.single("image"), async (req, res) => {
     const base64 = req.file.buffer.toString("base64");
     const dataUrl = `data:${mime};base64,${base64}`;
 
-    const hints = [];
-    if (Number.isFinite(lat) && Number.isFinite(lon)) {
-      hints.push(
-        `Device location hint (hint only, may be wrong): lat=${lat}, lon=${lon}` +
-          (Number.isFinite(acc) ? ` (accuracy ≈ ${acc}m)` : "")
-      );
-    }
-    if (userText) hints.push(`User request: ${userText}`);
+    const hasLoc = Number.isFinite(lat) && Number.isFinite(lon);
 
-    // Strict JSON schema for stable parsing
+    const locationBlock = hasLoc
+      ? `Location is available and HIGH PRIORITY.
+Coordinates: lat=${lat}, lon=${lon}${Number.isFinite(acc) ? ` (accuracy ≈ ${acc}m)` : ""}.
+Strongly prefer candidates plausible near these coordinates, unless the photo clearly contradicts it (then mention conflict and lower confidence).`
+      : `Location is NOT available. Rely on visual cues + user text.`;
+
+    // Model returns photoContext + candidates, but we only return candidates to the client.
     const schema = {
       type: "object",
       properties: {
+        photoContext: { type: "string" },
         candidates: {
           type: "array",
           minItems: 3,
@@ -70,26 +108,33 @@ app.post("/api/locate", upload.single("image"), async (req, res) => {
           }
         }
       },
-      required: ["candidates"],
+      required: ["photoContext", "candidates"],
       additionalProperties: false
     };
 
     const prompt = `
 You are a travel expert.
-Goal: Identify the location/place in the photo.
 
+Task A — PHOTO CONTEXT (3–4 sentences):
+Describe what is visible in THIS photo (viewpoint, lighting/time, weather if visible, materials, architecture, signs, crowd level, surroundings).
+Do NOT name/guess the place in this section.
+
+Task B — IDENTIFY PLACE:
 Return EXACTLY 3 candidates ranked best -> worst.
 For each candidate:
-- locate: locate the user by the photo or device location
-- name: short friendly name, with location (e.g. "Colosseum, Rome, Italy")
-- why: 1–2 sentences describing visual cues; if unsure, say so
-- confidence: number 0..1
-- searchQuery: query string to find a representative photo (usually same as name)
+- name: short friendly place name WITH city/country if possible
+- why: 1–2 sentences referencing visual cues AND (if provided) how coordinates affected the choice
+- confidence: 0..1
+- searchQuery: likely query to find a representative image
+
+${locationBlock}
+
+User request text:
+${userText ? userText : "(none)"}
 
 Rules:
-- Do NOT invent certainty.
-- If a device location is present, use it to identify the location/place user is in.
-${hints.length ? "\nHints:\n- " + hints.join("\n- ") : ""}
+- Don't invent certainty.
+- If photo contradicts coords, mention it in "why" and lower confidence.
 `.trim();
 
     const response = await client.responses.create({
@@ -106,7 +151,7 @@ ${hints.length ? "\nHints:\n- " + hints.join("\n- ") : ""}
       text: {
         format: {
           type: "json_schema",
-          name: "location_candidates",
+          name: "locate_with_context",
           strict: true,
           schema
         }
@@ -114,32 +159,34 @@ ${hints.length ? "\nHints:\n- " + hints.join("\n- ") : ""}
     });
 
     const parsed = JSON.parse(response.output_text);
+
+    // Cache photoContext for later /api/chat calls (no Android changes required)
+    if (parsed?.photoContext) setPhotoContext(req, parsed.photoContext);
+
+    // Return only what your existing Android app expects:
+    // { candidates: [...] }
     if (!parsed?.candidates || parsed.candidates.length !== 3) {
       return res.status(500).json({ error: "Model did not return 3 candidates." });
     }
 
-    res.json(parsed);
+    return res.json({ candidates: parsed.candidates });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: "Server error" });
+    return res.status(500).json({ error: "Server error" });
   }
 });
 
-/**
- * GET /api/place_image?q=...
- * Uses Wikipedia API to find a page with a thumbnail.
- * (More reliable than scraping Google; safe for prototypes.)
- *
- * returns:
- * { title, imageUrl, pageUrl }
- */
+/* ============================================================
+   /api/place_image?q=...
+   Wikipedia thumbnail fetch
+   ============================================================ */
 app.get("/api/place_image", async (req, res) => {
   try {
     const query = (req.query.q || "").toString().trim();
     if (!query) return res.status(400).json({ error: "Missing query param ?q=" });
 
     const searchUrl =
-      "https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit=6&srsearch=" +
+      "https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit=8&srsearch=" +
       encodeURIComponent(query);
 
     const searchResp = await fetch(searchUrl);
@@ -147,12 +194,11 @@ app.get("/api/place_image", async (req, res) => {
     const searchJson = await searchResp.json();
 
     const results = searchJson?.query?.search || [];
-
     for (const r of results) {
       const title = r.title;
 
       const imgUrl =
-        "https://en.wikipedia.org/w/api.php?action=query&prop=pageimages&format=json&pithumbsize=800&titles=" +
+        "https://en.wikipedia.org/w/api.php?action=query&prop=pageimages&format=json&pithumbsize=900&titles=" +
         encodeURIComponent(title);
 
       const imgResp = await fetch(imgUrl);
@@ -164,7 +210,6 @@ app.get("/api/place_image", async (req, res) => {
       let imageUrl = page?.thumbnail?.source || null;
 
       if (imageUrl) {
-        // normalize protocol-relative urls
         if (imageUrl.startsWith("//")) imageUrl = "https:" + imageUrl;
         const pageUrl =
           "https://en.wikipedia.org/wiki/" + encodeURIComponent(title.replace(/ /g, "_"));
@@ -175,51 +220,50 @@ app.get("/api/place_image", async (req, res) => {
     return res.json({ title: null, imageUrl: null, pageUrl: null });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: "Server error" });
+    return res.status(500).json({ error: "Server error" });
   }
 });
 
-/**
- * POST /api/chat
- * JSON: { place: string, message: string }
- *
- * Used for:
- * - facts (when message is empty or "facts")
- * - follow-up questions
- *
- * returns: { text: string }
- */
+/* ============================================================
+   /api/chat
+   - accepts ONLY { place, message } (Android compatible)
+   - uses cached photoContext (if available) to tailor facts/answers
+   ============================================================ */
 app.post("/api/chat", async (req, res) => {
   try {
     const place = (req.body?.place || "").toString().trim();
     const message = (req.body?.message || "").toString().trim();
-
     if (!place) return res.status(400).json({ error: "Missing JSON field 'place'." });
 
-    const mode =
-      !message || /^facts?$|^guide$|^info$|^history$/i.test(message) ? "FACTS" : "QA";
+    const isFacts = !message || /^facts?$|^guide$|^info$|^history$/i.test(message);
 
-    const prompt =
-      mode === "FACTS"
-        ? `
+    const photoContext = getPhotoContext(req); // best-effort (IP+UA keyed)
+
+    const prompt = isFacts
+      ? `
 You are a friendly travel guide.
-Place: ${place}
 
-Write a concise chat-style answer:
-- 2–3 lines:where the individual is, whats it is + why it’s famous
-- 3 bullet historical highlights (don’t invent specifics; if unsure say "unknown")
+Place: ${place}
+Photo context (from user's last uploaded photo): ${photoContext || "(not available)"}
+
+Write a concise answer that feels tailored to THIS photo:
+- 1 short opener referencing the photo context if available (angle/time/weather/crowd)
+- 2–3 lines: what it is + why it’s famous
+- 3 bullet historical highlights (avoid making up specifics; if unsure say "unknown")
 - 3 bullet fun facts
-- 3 bullet practical visiting tips
-Keep it readable and not too long, also say something personal to the user to break the 4th wall, be unhinged, sometimes act crazy.
-`.trim()
-        : `
-You are a friendly travel guide.
-Place: ${place}
+- 3 bullet practical visiting tips relevant to the photo context
 
+Keep it readable and not too long. Be a bit crazy and unhinged, but also act normally.
+`.trim()
+      : `
+You are a friendly travel guide.
+
+Place: ${place}
+Photo context: ${photoContext || "(not available)"}
 User question: ${message}
 
-Answer clearly and practically, add some rare rude comments, its a sort of game. be unhinged, sometimes act crazy - never admit it.
-If the user asks for prices/hours/tickets "today", say you may be out of date and suggest checking the official site. Mention ivan, joke, bully or praise him in random small context.
+Answer clearly and practically. If photo context helps, reference it briefly. briefly mention Ivan in some sort of context.
+If user asks for prices/hours/tickets "today", say you may be out of date and suggest checking official sources.
 `.trim();
 
     const response = await client.responses.create({
@@ -227,10 +271,10 @@ If the user asks for prices/hours/tickets "today", say you may be out of date an
       input: [{ role: "user", content: prompt }]
     });
 
-    res.json({ text: response.output_text });
+    return res.json({ text: response.output_text });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: "Server error" });
+    return res.status(500).json({ error: "Server error" });
   }
 });
 
