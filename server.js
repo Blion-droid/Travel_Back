@@ -80,7 +80,8 @@ Goal: Identify the location/place in the photo.
 
 Return EXACTLY 3 candidates ranked best -> worst.
 For each candidate:
-- name: short friendly name, location if known (e.g. "Colosseum, Rome, Italy")
+- locate: locate the user by the photo or device location
+- name: short friendly name, with location (e.g. "Colosseum, Rome, Italy")
 - why: 1–2 sentences describing visual cues; if unsure, say so
 - confidence: number 0..1
 - searchQuery: query string to find a representative photo (usually same as name)
