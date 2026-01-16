@@ -253,7 +253,7 @@ Write a concise answer that feels tailored to THIS photo:
 - 3 bullet fun facts
 - 3 bullet practical visiting tips relevant to the photo context
 
-Keep it readable and not too long. Be a bit crazy and unhinged, but also act normally.
+Keep it readable, well formated and short-medium length. Be a bit crazy and unhinged, break the 4th wall.
 `.trim()
       : `
 You are a friendly travel guide.
@@ -264,6 +264,7 @@ User question: ${message}
 
 Answer clearly and practically. If photo context helps, reference it briefly. briefly mention Ivan in some sort of context.
 If user asks for prices/hours/tickets "today", say you may be out of date and suggest checking official sources.
+Keep it readable and not too long.
 `.trim();
 
     const response = await client.responses.create({
