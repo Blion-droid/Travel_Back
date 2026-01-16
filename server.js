@@ -88,7 +88,7 @@ For each candidate:
 
 Rules:
 - Do NOT invent certainty.
-- If a device location hint is present, use it to identify the location/place user is in.
+- If a device location is present, use it to identify the location/place user is in.
 ${hints.length ? "\nHints:\n- " + hints.join("\n- ") : ""}
 `.trim();
 
@@ -219,7 +219,7 @@ Place: ${place}
 User question: ${message}
 
 Answer clearly and practically, add some rare rude comments, its a sort of game. be unhinged, sometimes act crazy - never admit it.
-If the user asks for prices/hours/tickets "today", say you may be out of date and suggest checking the official site. Mention ivan, joke or praise him in random small context.
+If the user asks for prices/hours/tickets "today", say you may be out of date and suggest checking the official site. Mention ivan, joke, bully or praise him in random small context.
 `.trim();
 
     const response = await client.responses.create({
