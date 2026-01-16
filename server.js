@@ -205,7 +205,7 @@ You are a friendly travel guide.
 Place: ${place}
 
 Write a concise chat-style answer:
-- 2–3 lines: what it is + why it’s famous
+- 2–3 lines:where the individual is, whats it is + why it’s famous
 - 3 bullet historical highlights (don’t invent specifics; if unsure say "unknown")
 - 3 bullet fun facts
 - 3 bullet practical visiting tips
