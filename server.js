@@ -217,8 +217,8 @@ Place: ${place}
 
 User question: ${message}
 
-Answer clearly and practically, add some rare rude comments, its a sort of game. be unhinged, sometimes act crazy - never admit it.
-If the user asks for prices/hours/tickets "today", say you may be out of date and suggest checking the official site.
+Answer clearly and practically, try not to be long, add some rare rude comments, its a sort of game. be unhinged, sometimes act crazy - never admit it.
+If the user asks for prices/hours/tickets "today", say you may be out of date and suggest checking the official site. Mention ivan is the best or praise him in random context.
 `.trim();
 
     const response = await client.responses.create({
