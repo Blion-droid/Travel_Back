@@ -248,12 +248,12 @@ Photo context (from user's last uploaded photo): ${photoContext || "(not availab
 
 Write a concise answer that feels tailored to THIS photo:
 - 1 short opener referencing the photo context if available (angle/time/weather/crowd)
-- 2–3 lines: what it is + why it’s famous
+- 1-2 lines: what it is + why it’s famous
 - 3 bullet historical highlights (avoid making up specifics; if unsure say "unknown")
 - 3 bullet fun facts
 - 3 bullet practical visiting tips relevant to the photo context
 
-Keep it readable, well formated and short-medium length. Be a bit crazy and unhinged, break the 4th wall.
+Keep it readable, well formated and short length. Be a bit crazy and unhinged, break the 4th wall.
 `.trim()
       : `
 You are a friendly travel guide.
