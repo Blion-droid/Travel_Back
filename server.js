@@ -1,3 +1,7 @@
+// server.js  (ESM)
+// Requires: npm i express cors multer openai
+// Node 18+ (Render uses Node 22) so global fetch is available.
+
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -5,10 +9,10 @@ import OpenAI from "openai";
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
 /* ============================================================
-   Request logging (Render-friendly: stdout/stderr)
+   Request logging + request id (Render-friendly)
    ============================================================ */
 function mkReqId() {
   return Math.random().toString(16).slice(2) + Date.now().toString(16);
@@ -21,7 +25,7 @@ app.use((req, res, next) => {
   console.log(
     `[${req.reqId}] --> ${req.method} ${req.originalUrl} ua="${(req.headers["user-agent"] || "")
       .toString()
-      .slice(0, 80)}"`
+      .slice(0, 120)}"`
   );
 
   res.on("finish", () => {
@@ -29,11 +33,9 @@ app.use((req, res, next) => {
     console.log(`[${req.reqId}] <-- ${req.method} ${req.originalUrl} ${res.statusCode} ${ms}ms`);
   });
 
-  // Useful for debugging client timeouts/disconnects
-  req.on("close", () => {
-    if (!res.headersSent) {
-      console.warn(`[${req.reqId}] !! client disconnected before response sent`);
-    }
+  // real abort only (avoid false positives from "close")
+  req.on("aborted", () => {
+    console.warn(`[${req.reqId}] !! request aborted by client`);
   });
 
   next();
@@ -47,79 +49,55 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 } // 10MB
 });
 
+/* ============================================================
+   OpenAI
+   ============================================================ */
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 app.get("/health", (_, res) => res.json({ ok: true, ts: Date.now() }));
 
 /* ============================================================
-   OPTION A: Server-side photoContext cache (NO app changes)
+   Debug auth (optional)
+   If DEBUG_TOKEN is set on Render, debug endpoints require header:
+   x-debug-token: <DEBUG_TOKEN>
    ============================================================ */
-const PHOTO_TTL_MS = 10 * 60 * 1000; // 10 minutes
-const photoContextCache = new Map();
+const DEBUG_TOKEN = process.env.DEBUG_TOKEN || "";
 
-/** best-effort key: IP + User-Agent reduces collisions */
-function cacheKeyFromReq(req) {
-  const xf = req.headers["x-forwarded-for"];
-  const ip =
-    (typeof xf === "string" ? xf.split(",")[0].trim() : null) || req.ip || "unknown";
-  const ua = (req.headers["user-agent"] || "ua:unknown").toString().slice(0, 200);
-  return `${ip}__${ua}`;
+function requireDebugAuth(req, res, next) {
+  if (!DEBUG_TOKEN) return next(); // open if not configured
+  const got = (req.headers["x-debug-token"] || "").toString();
+  if (got !== DEBUG_TOKEN) return res.status(401).json({ error: "Unauthorized debug token" });
+  next();
 }
-
-function setPhotoContext(req, photoContext) {
-  const key = cacheKeyFromReq(req);
-  photoContextCache.set(key, { photoContext, expiresAt: Date.now() + PHOTO_TTL_MS });
-}
-
-function getPhotoContext(req) {
-  const key = cacheKeyFromReq(req);
-  const entry = photoContextCache.get(key);
-  if (!entry) return null;
-  if (Date.now() > entry.expiresAt) {
-    photoContextCache.delete(key);
-    return null;
-  }
-  return entry.photoContext;
-}
-
-// Cleanup once/min to avoid memory growth
-setInterval(() => {
-  const now = Date.now();
-  for (const [k, v] of photoContextCache.entries()) {
-    if (now > v.expiresAt) photoContextCache.delete(k);
-  }
-}, 60_000);
 
 /* ============================================================
-   GEO HELPERS (OSM Nominatim + Overpass)
-   - Designed to NOT block your request (hard budget)
-   - Works worldwide as far as OSM coverage allows
+   GEO config (slow-but-concrete: used in async job)
    ============================================================ */
+const OVERPASS_TIMEOUT_MS = Number(process.env.OVERPASS_TIMEOUT_MS || 20000);
+const NOMINATIM_TIMEOUT_MS = Number(process.env.NOMINATIM_TIMEOUT_MS || 10000);
+const OVERPASS_RADIUS_M = Number(process.env.OVERPASS_RADIUS_M || 1200);
+const POI_TARGET_COUNT = Number(process.env.POI_TARGET_COUNT || 8);
 
-const GEO_TTL_MS = 10 * 60 * 1000; // 10 minutes
-const geoCache = new Map();
+const OSM_CONTACT = process.env.OSM_CONTACT_EMAIL || "dev@yourdomain.com";
+const OSM_UA = `travel-vision-backend/1.0 (contact: ${OSM_CONTACT})`;
 
-const GEO_BUDGET_MS = Number(process.env.GEO_BUDGET_MS || 3500); // total time allowed for geo
-const NOMINATIM_TIMEOUT_MS = Number(process.env.NOMINATIM_TIMEOUT_MS || 1500);
-const OVERPASS_TIMEOUT_MS = Number(process.env.OVERPASS_TIMEOUT_MS || 2500);
-const OVERPASS_RADIUS_M = Number(process.env.OVERPASS_RADIUS_M || 1500);
-
-// IMPORTANT: set this on Render as env var to be polite to OSM services
-// e.g. OSM_CONTACT_EMAIL=your-real-email@domain.com
-const OSM_CONTACT = process.env.OSM_CONTACT_EMAIL;
-const OSM_UA = `travel-locate-server/1.0 (contact: ${OSM_CONTACT})`;
-
-// Overpass endpoints (first is primary, others are fallback)
 const OVERPASS_ENDPOINTS = [
   "https://overpass-api.de/api/interpreter",
   "https://overpass.kumi.systems/api/interpreter",
   "https://overpass.openstreetmap.ru/api/interpreter"
 ];
 
-function geoCacheKey(lat, lon, radiusM) {
-  const rLat = Math.round(lat * 1e5) / 1e5;
-  const rLon = Math.round(lon * 1e5) / 1e5;
-  return `${rLat},${rLon},r=${radiusM}`;
+/* ============================================================
+   Helpers
+   ============================================================ */
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 function haversineMeters(lat1, lon1, lat2, lon2) {
@@ -133,59 +111,10 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 
-async function fetchWithTimeout(url, options, timeoutMs) {
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...options, signal: controller.signal });
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-function withDeadline(promise, ms, label, reqId) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error(`deadline(${label}) ${ms}ms`)), ms))
-  ]).catch((e) => {
-    console.warn(`[${reqId}] ${label} failed: ${e?.message || e}`);
-    return null;
-  });
-}
-
-async function reverseGeocode(lat, lon) {
-  const url =
-    `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${encodeURIComponent(
-      lat
-    )}&lon=${encodeURIComponent(lon)}&zoom=18&addressdetails=1`;
-
-  const resp = await fetchWithTimeout(
-    url,
-    {
-      headers: {
-        "User-Agent": OSM_UA,
-        "Accept-Language": "en"
-      }
-    },
-    NOMINATIM_TIMEOUT_MS
-  );
-
-  if (!resp.ok) throw new Error(`Nominatim reverse failed: ${resp.status}`);
-  const json = await resp.json();
-
-  const addr = json?.address || {};
-  return {
-    displayName: json?.display_name || null,
-    city: addr.city || addr.town || addr.village || addr.municipality || addr.county || null,
-    state: addr.state || null,
-    country: addr.country || null
-  };
-}
-
 function buildOverpassQuery(lat, lon, radiusM) {
-  // Attraction-focused, named POIs
+  // Attraction-ish POIs with names
   return `
-[out:json][timeout:20];
+[out:json][timeout:25];
 (
   nwr(around:${radiusM},${lat},${lon})["tourism"]["name"];
   nwr(around:${radiusM},${lat},${lon})["historic"]["name"];
@@ -198,13 +127,14 @@ out center 80;
 `.trim();
 }
 
-async function fetchOverpassWithFallback(query, reqId) {
-  // Try endpoints in order; each attempt uses the same timeout.
+async function fetchOverpassWithFallback(query, reqId, timeoutOverrideMs) {
   let lastErr = null;
+  const timeoutMs = Number.isFinite(timeoutOverrideMs) ? timeoutOverrideMs : OVERPASS_TIMEOUT_MS;
 
   for (const endpoint of OVERPASS_ENDPOINTS) {
+    const t0 = Date.now();
     try {
-      console.log(`[${reqId}] Overpass try ${endpoint}`);
+      console.log(`[${reqId}] Overpass try ${endpoint} timeout=${timeoutMs}ms`);
       const resp = await fetchWithTimeout(
         endpoint,
         {
@@ -215,26 +145,30 @@ async function fetchOverpassWithFallback(query, reqId) {
           },
           body: query
         },
-        OVERPASS_TIMEOUT_MS
+        timeoutMs
       );
+      const ms = Date.now() - t0;
 
-      if (!resp.ok) throw new Error(`Overpass HTTP ${resp.status}`);
+      if (!resp.ok) {
+        const txt = await resp.text().catch(() => "");
+        throw new Error(`Overpass HTTP ${resp.status} (${ms}ms) body=${txt.slice(0, 140)}`);
+      }
 
       const json = await resp.json();
+      console.log(`[${reqId}] Overpass OK ${endpoint} (${ms}ms) elements=${json?.elements?.length || 0}`);
       return json;
     } catch (e) {
       lastErr = e;
-      console.warn(`[${reqId}] Overpass endpoint failed: ${endpoint} err=${e?.message || e}`);
+      console.warn(`[${reqId}] Overpass fail ${endpoint}: ${e?.message || e}`);
     }
   }
 
   throw lastErr || new Error("Overpass failed (no endpoints succeeded)");
 }
 
-async function fetchNearbyPois(lat, lon, radiusM, reqId) {
+async function fetchNearbyPois(lat, lon, radiusM, reqId, timeoutOverrideMs) {
   const overpassQuery = buildOverpassQuery(lat, lon, radiusM);
-
-  const json = await fetchOverpassWithFallback(overpassQuery, reqId);
+  const json = await fetchOverpassWithFallback(overpassQuery, reqId, timeoutOverrideMs);
   const elements = Array.isArray(json?.elements) ? json.elements : [];
 
   const poiList = elements
@@ -274,164 +208,147 @@ async function fetchNearbyPois(lat, lon, radiusM, reqId) {
     })
     .filter(Boolean);
 
-  // Sort by distance, de-dupe by name, keep small for prompt
+  // distance sort, de-dupe by name, keep up to 25
   const seen = new Set();
-  const deduped = [];
+  const out = [];
   for (const p of poiList.sort((a, b) => a.distance_m - b.distance_m)) {
     const key = p.name.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
-    deduped.push(p);
-    if (deduped.length >= 25) break;
+    out.push(p);
+    if (out.length >= 25) break;
   }
 
-  return deduped;
+  return out;
 }
 
-async function getGeoContext(lat, lon, reqId) {
-  const key = geoCacheKey(lat, lon, OVERPASS_RADIUS_M);
-  const cached = geoCache.get(key);
-  if (cached && Date.now() < cached.expiresAt) {
-    console.log(`[${reqId}] GEO cache hit pois=${cached.value.pois.length}`);
-    return cached.value;
-  }
-
-  console.log(
-    `[${reqId}] GEO start budget=${GEO_BUDGET_MS}ms radius=${OVERPASS_RADIUS_M}m nominatimTimeout=${NOMINATIM_TIMEOUT_MS} overpassTimeout=${OVERPASS_TIMEOUT_MS}`
-  );
+async function reverseGeocode(lat, lon, reqId) {
+  // Primary: Nominatim
+  const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${encodeURIComponent(
+    lat
+  )}&lon=${encodeURIComponent(lon)}&zoom=18&addressdetails=1`;
 
   const t0 = Date.now();
+  try {
+    const resp = await fetchWithTimeout(
+      url,
+      {
+        headers: {
+          "User-Agent": OSM_UA,
+          "Accept-Language": "en",
+          "Referer": "https://travel-vision-backend.local/"
+        }
+      },
+      NOMINATIM_TIMEOUT_MS
+    );
+    const ms = Date.now() - t0;
 
-  // Run reverse + POIs in parallel, but enforce total deadline so we never block OpenAI too long.
-  const geoResult = await withDeadline(
-    Promise.all([
-      reverseGeocode(lat, lon).catch((e) => {
-        console.warn(`[${reqId}] Nominatim failed: ${e?.message || e}`);
-        return { displayName: null, city: null, state: null, country: null };
-      }),
-      fetchNearbyPois(lat, lon, OVERPASS_RADIUS_M, reqId).catch((e) => {
-        console.warn(`[${reqId}] Overpass failed: ${e?.message || e}`);
-        return [];
-      })
-    ]),
-    GEO_BUDGET_MS,
-    "GEO_BUDGET",
-    reqId
-  );
+    if (!resp.ok) throw new Error(`Nominatim reverse failed: ${resp.status} (${ms}ms)`);
+    const json = await resp.json();
+    const addr = json?.address || {};
+    const out = {
+      displayName: json?.display_name || null,
+      city: addr.city || addr.town || addr.village || addr.municipality || addr.county || null,
+      state: addr.state || null,
+      country: addr.country || null
+    };
+    console.log(`[${reqId}] Nominatim OK (${ms}ms) "${(out.displayName || "").slice(0, 80)}"`);
+    return out;
+  } catch (e) {
+    console.warn(`[${reqId}] Nominatim failed, fallback: ${e?.message || e}`);
 
-  let reverse = { displayName: null, city: null, state: null, country: null };
-  let pois = [];
+    // Fallback: BigDataCloud (no key)
+    const fb = `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${encodeURIComponent(
+      lat
+    )}&longitude=${encodeURIComponent(lon)}&localityLanguage=en`;
 
-  if (geoResult) {
-    reverse = geoResult[0] || reverse;
-    pois = geoResult[1] || [];
-  } else {
-    console.warn(`[${reqId}] GEO budget exceeded; continuing without geo context`);
+    const resp2 = await fetchWithTimeout(fb, { headers: { "User-Agent": OSM_UA } }, 8000);
+    if (!resp2.ok) throw new Error(`Fallback reverse failed: ${resp2.status}`);
+    const j = await resp2.json();
+
+    const displayName =
+      [j?.locality, j?.principalSubdivision, j?.countryName].filter(Boolean).join(", ") || null;
+
+    const out = {
+      displayName,
+      city: j?.city || j?.locality || null,
+      state: j?.principalSubdivision || null,
+      country: j?.countryName || null
+    };
+    console.log(`[${reqId}] Fallback reverse OK "${(out.displayName || "").slice(0, 80)}"`);
+    return out;
   }
-
-  const ms = Date.now() - t0;
-  console.log(
-    `[${reqId}] GEO done ms=${ms} pois=${pois.length} reverse="${(reverse.displayName || "").slice(
-      0,
-      90
-    )}"`
-  );
-
-  const value = { reverse, pois, radiusM: OVERPASS_RADIUS_M };
-  geoCache.set(key, { value, expiresAt: Date.now() + GEO_TTL_MS });
-  return value;
 }
 
-// Cleanup geo cache once/min
+/* ============================================================
+   Locate job system (prevents client/proxy timeouts)
+   ============================================================ */
+const JOB_TTL_MS = Number(process.env.JOB_TTL_MS || 15 * 60 * 1000);
+const locateJobs = new Map(); // jobId -> job
+
+function makeJobId() {
+  return Math.random().toString(16).slice(2) + Date.now().toString(16);
+}
+
+function trace(job, step, detail) {
+  const item = { ts: Date.now(), step, detail };
+  job.trace.push(item);
+  console.log(`[job:${job.jobId}] ${step} ${detail}`);
+}
+
 setInterval(() => {
   const now = Date.now();
-  for (const [k, v] of geoCache.entries()) {
-    if (now > v.expiresAt) geoCache.delete(k);
+  for (const [id, job] of locateJobs.entries()) {
+    if (now - job.createdAt > JOB_TTL_MS) locateJobs.delete(id);
   }
 }, 60_000);
 
-
-app.get("/debug/overpass", async (req, res) => {
-  const lat = Number(req.query.lat);
-  const lon = Number(req.query.lon);
-  const r = Number(req.query.r || 800);
-
-  const q = buildOverpassQuery(lat, lon, r);
-
+async function runLocateJob(job) {
   try {
-    const resp = await fetch("https://overpass-api.de/api/interpreter", {
-      method: "POST",
-      headers: {
-        "Content-Type": "text/plain",
-        "User-Agent": OSM_UA
-      },
-      body: q
-    });
+    job.status = "geo";
+    trace(job, "geo_start", `lat=${job.lat} lon=${job.lon} baseR=${OVERPASS_RADIUS_M}m`);
 
-    const text = await resp.text();
-    res.status(200).json({
-      ok: resp.ok,
-      status: resp.status,
-      statusText: resp.statusText,
-      bodyPreview: text.slice(0, 300)
-    });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
+    // 1) Reverse first
+    const reverse = await reverseGeocode(job.lat, job.lon, `job:${job.jobId}`);
+    job.geo.reverse = reverse;
+    trace(job, "reverse_done", `${(reverse.displayName || "").slice(0, 120)}`);
 
-/* ============================================================
-   /api/locate
-   - Generates photoContext + candidates
-   - Uses reverse-geocode + nearby POIs (budgeted) to avoid wild guesses
-   - Caches photoContext server-side
-   - Returns ONLY candidates (Android-compatible)
-   ============================================================ */
-app.post("/api/locate", upload.single("image"), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: "Missing form field 'image'." });
+    // 2) Overpass next (increase radius until we get enough)
+    const radii = [
+      OVERPASS_RADIUS_M,
+      Math.round(OVERPASS_RADIUS_M * 2),
+      Math.round(OVERPASS_RADIUS_M * 4)
+    ];
 
-    const userText = (req.body?.message || "").toString().trim();
-    const lat = req.body?.lat != null ? Number(req.body.lat) : null;
-    const lon = req.body?.lon != null ? Number(req.body.lon) : null;
-    const acc = req.body?.accuracyMeters != null ? Number(req.body.accuracyMeters) : null;
+    let pois = [];
+    let usedRadius = radii[0];
 
-    const mime = req.file.mimetype || "image/jpeg";
-    const base64 = req.file.buffer.toString("base64");
-    const dataUrl = `data:${mime};base64,${base64}`;
-
-    const hasLoc = Number.isFinite(lat) && Number.isFinite(lon);
-
-    console.log(
-      `[${req.reqId}] LOCATE start hasLoc=${hasLoc} lat=${lat} lon=${lon} acc=${acc} userTextLen=${userText.length} imgBytes=${req.file.buffer.length}`
-    );
-
-    // Budgeted geo context (never blocks too long)
-    let geo = null;
-    if (hasLoc) {
-      console.log(`[${req.reqId}] LOCATE geo phase start`);
-      geo = await getGeoContext(lat, lon, req.reqId).catch((e) => {
-        console.warn(`[${req.reqId}] LOCATE geo phase failed: ${e?.message || e}`);
-        return null;
-      });
-      console.log(
-        `[${req.reqId}] LOCATE geo phase done pois=${geo?.pois?.length || 0} reverse="${
-          (geo?.reverse?.displayName || "").slice(0, 80)
-        }"`
-      );
+    for (const r of radii) {
+      usedRadius = r;
+      trace(job, "overpass_start", `radius=${r}m timeout=${OVERPASS_TIMEOUT_MS}ms`);
+      const got = await fetchNearbyPois(job.lat, job.lon, r, `job:${job.jobId}`);
+      trace(job, "overpass_done", `radius=${r}m pois=${got.length}`);
+      pois = got;
+      if (pois.length >= POI_TARGET_COUNT) break;
     }
 
-    const hasPois = Boolean(geo?.pois?.length);
+    job.geo.radiusM = usedRadius;
+    job.geo.pois = pois;
 
-    const locationBlock = hasLoc
-      ? `Location is available and HIGH PRIORITY.
-Coordinates: lat=${lat}, lon=${lon}${Number.isFinite(acc) ? ` (accuracy ≈ ${acc}m)` : ""}.
-Reverse-geocoded area (may be approximate): ${geo?.reverse?.displayName || "(unavailable)"}.
+    // 3) OpenAI last
+    job.status = "openai";
+    trace(job, "openai_start", `pois=${pois.length} reverse="${(reverse.displayName || "").slice(0, 60)}"`);
 
-Nearby places from map data (within ${geo?.radiusM || OVERPASS_RADIUS_M}m):
+    const hasPois = pois.length > 0;
+
+    const locationBlock = `Location is available and HIGH PRIORITY.
+Coordinates: lat=${job.lat}, lon=${job.lon}${Number.isFinite(job.acc) ? ` (accuracy ≈ ${job.acc}m)` : ""}.
+Reverse-geocoded area: ${reverse.displayName || "(unavailable)"}.
+
+Nearby places from map data (within ${usedRadius}m):
 ${
   hasPois
-    ? geo.pois
+    ? pois
         .slice(0, 20)
         .map((p) => `- ${p.name} (${p.type}, ~${p.distance_m}m)${p.hint ? ` [${p.hint}]` : ""}`)
         .join("\n")
@@ -440,8 +357,8 @@ ${
 
 CRITICAL RULES:
 - If a nearby-places list is provided and is not empty, you MUST choose the 3 candidates FROM THAT LIST.
-- Only choose something outside the list if the PHOTO CLEARLY contradicts the coordinates; if so, include the phrase "coordinate conflict" in why AND set confidence <= 0.2.`
-      : `Location is NOT available. Rely on visual cues + user text.`;
+- Candidates must be real named places (POI/park/monument/neighborhood/city). Do NOT output generic descriptions like "living room".
+- Only choose outside the list if the PHOTO CLEARLY contradicts the coordinates; if so include "coordinate conflict" and set confidence <= 0.2.`;
 
     const schema = {
       type: "object",
@@ -479,26 +396,23 @@ Task B — IDENTIFY PLACE:
 Return EXACTLY 3 candidates ranked best -> worst.
 For each candidate:
 - name: short friendly place name WITH city/country if possible
-- why: 1–2 sentences referencing visual cues AND (if provided) how coordinates affected the choice. If distances are provided, say "very close" (hundreds of meters) or "farther" (over ~1km).
+- why: 1–2 sentences referencing visual cues AND how coordinates + nearby list affected the choice
 - confidence: 0..1
 - searchQuery: likely query to find a representative image
 
 ${locationBlock}
 
 User request text:
-${userText ? userText : "(none)"}
+${job.userText ? job.userText : "(none)"}
 
 Rules:
 - Don't invent certainty.
 - If photo contradicts coords, mention it in "why" and lower confidence.
-- If a nearby-places list is provided and non-empty, pick ONLY from that list unless you explicitly flag "coordinate conflict" (confidence <= 0.2).
+- If nearby list non-empty, pick ONLY from it unless "coordinate conflict" (confidence <= 0.2).
 `.trim();
 
-    console.log(
-      `[${req.reqId}] LOCATE calling OpenAI model=gpt-4.1-mini temp=0 hasPois=${hasPois} poisCount=${geo?.pois?.length || 0}`
-    );
+    job.debug.prompt = prompt;
 
-    const tModel0 = Date.now();
     const response = await client.responses.create({
       model: "gpt-4.1-mini",
       temperature: 0,
@@ -507,7 +421,7 @@ Rules:
           role: "user",
           content: [
             { type: "input_text", text: prompt },
-            { type: "input_image", image_url: dataUrl }
+            { type: "input_image", image_url: job.dataUrl }
           ]
         }
       ],
@@ -520,102 +434,79 @@ Rules:
         }
       }
     });
-    console.log(`[${req.reqId}] LOCATE OpenAI responded in ${Date.now() - tModel0}ms`);
 
-    const parsed = JSON.parse(response.output_text);
+    const raw = response.output_text;
+    job.debug.openaiRaw = raw.slice(0, 4000);
 
-    if (parsed?.photoContext) setPhotoContext(req, parsed.photoContext);
-
-    // OPTIONAL: If we had POIs and model ignored them without "coordinate conflict", do one repair retry
-    if (hasLoc && hasPois) {
-      const allowed = new Set(geo.pois.map((p) => p.name.toLowerCase()));
-      const chosen = (parsed?.candidates || []).map((c) => (c?.name || "").toLowerCase());
-
-      const anyMatches = chosen.some((nm) => {
-        for (const a of allowed) {
-          if (nm.includes(a) || a.includes(nm)) return true;
-        }
-        return false;
-      });
-
-      const mentionsConflict = (parsed?.candidates || []).some((c) =>
-        String(c?.why || "").toLowerCase().includes("coordinate conflict")
-      );
-
-      if (!anyMatches && !mentionsConflict) {
-        console.warn(
-          `[${req.reqId}] LOCATE model ignored POI list; attempting 1 repair retry. chosen=${JSON.stringify(
-            parsed?.candidates || []
-          ).slice(0, 300)}`
-        );
-
-        const repairPrompt = `
-You must pick EXACTLY 3 candidates FROM THIS LIST (do not invent others).
-If the photo clearly contradicts the GPS, you may pick outside the list but then:
-- include the phrase "coordinate conflict" in why
-- set confidence <= 0.2
-
-Nearby places list:
-${geo.pois
-  .slice(0, 20)
-  .map((p) => `- ${p.name} (${p.type}, ~${p.distance_m}m)`)
-  .join("\n")}
-
-Return JSON with the same schema: { photoContext, candidates[3] }.
-`.trim();
-
-        const tRepair0 = Date.now();
-        const repairResp = await client.responses.create({
-          model: "gpt-4.1-mini",
-          temperature: 0,
-          input: [
-            {
-              role: "user",
-              content: [
-                { type: "input_text", text: repairPrompt },
-                { type: "input_image", image_url: dataUrl }
-              ]
-            }
-          ],
-          text: {
-            format: {
-              type: "json_schema",
-              name: "locate_with_context",
-              strict: true,
-              schema
-            }
-          }
-        });
-        console.log(`[${req.reqId}] LOCATE repair OpenAI responded in ${Date.now() - tRepair0}ms`);
-
-        const repaired = JSON.parse(repairResp.output_text);
-        if (repaired?.photoContext) setPhotoContext(req, repaired.photoContext);
-
-        if (repaired?.candidates?.length === 3) {
-          console.log(
-            `[${req.reqId}] LOCATE returning repaired candidates: ${repaired.candidates
-              .map((c) => c.name)
-              .join(" | ")}`
-          );
-          return res.json({ candidates: repaired.candidates });
-        }
-      }
-    }
-
+    const parsed = JSON.parse(raw);
     if (!parsed?.candidates || parsed.candidates.length !== 3) {
-      console.error(
-        `[${req.reqId}] LOCATE ERROR: Model did not return 3 candidates. output_text=${response.output_text.slice(
-          0,
-          500
-        )}`
-      );
-      return res.status(500).json({ error: "Model did not return 3 candidates." });
+      throw new Error("Model did not return 3 candidates");
     }
+
+    job.result = {
+      photoContext: parsed.photoContext,
+      candidates: parsed.candidates
+    };
+
+    job.status = "done";
+    trace(job, "openai_done", parsed.candidates.map((c) => c.name).join(" | "));
+  } catch (e) {
+    job.status = "error";
+    job.error = String(e?.message || e);
+    trace(job, "error", job.error);
+  } finally {
+    // free big blob
+    job.dataUrl = null;
+  }
+}
+
+/* ============================================================
+   /api/locate  -> returns { jobId } quickly
+   Requires lat/lon (this build is location-first)
+   ============================================================ */
+app.post("/api/locate", upload.single("image"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "Missing form field 'image'." });
+
+    const userText = (req.body?.message || "").toString().trim();
+    const lat = req.body?.lat != null ? Number(req.body.lat) : null;
+    const lon = req.body?.lon != null ? Number(req.body.lon) : null;
+    const acc = req.body?.accuracyMeters != null ? Number(req.body.accuracyMeters) : null;
+
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      return res.status(400).json({ error: "Missing/invalid lat/lon. This server requires location." });
+    }
+
+    const mime = req.file.mimetype || "image/jpeg";
+    const base64 = req.file.buffer.toString("base64");
+    const dataUrl = `data:${mime};base64,${base64}`;
+
+    const jobId = makeJobId();
+    const job = {
+      jobId,
+      createdAt: Date.now(),
+      status: "pending",
+      error: null,
+      trace: [],
+      userText,
+      lat,
+      lon,
+      acc,
+      dataUrl,
+      geo: { reverse: null, pois: [], radiusM: null },
+      result: null,
+      debug: { prompt: null, openaiRaw: null }
+    };
+
+    locateJobs.set(jobId, job);
 
     console.log(
-      `[${req.reqId}] LOCATE returning candidates: ${parsed.candidates.map((c) => c.name).join(" | ")}`
+      `[${req.reqId}] LOCATE job created jobId=${jobId} lat=${lat} lon=${lon} acc=${acc} bytes=${req.file.buffer.length}`
     );
-    return res.json({ candidates: parsed.candidates });
+
+    setImmediate(() => runLocateJob(job));
+
+    return res.json({ jobId });
   } catch (e) {
     console.error(`[${req.reqId}] /api/locate ERROR`, e);
     return res.status(500).json({ error: "Server error" });
@@ -623,79 +514,61 @@ Return JSON with the same schema: { photoContext, candidates[3] }.
 });
 
 /* ============================================================
-   /api/place_image?q=...
-   Wikipedia thumbnail fetch (budgeted)
+   /api/locate_result?jobId=...
+   -> pending/geo/openai/done/error
    ============================================================ */
-app.get("/api/place_image", async (req, res) => {
-  try {
-    const query = (req.query.q || "").toString().trim();
-    if (!query) return res.status(400).json({ error: "Missing query param ?q=" });
+app.get("/api/locate_result", async (req, res) => {
+  const jobId = (req.query.jobId || "").toString();
+  const job = locateJobs.get(jobId);
+  if (!job) return res.status(404).json({ error: "Unknown jobId" });
 
-    console.log(`[${req.reqId}] place_image q="${query.slice(0, 120)}"`);
-
-    const searchUrl =
-      "https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit=8&srsearch=" +
-      encodeURIComponent(query);
-
-    const searchResp = await fetchWithTimeout(searchUrl, {}, 8000);
-    if (!searchResp.ok) return res.status(502).json({ error: "Wikipedia search failed" });
-    const searchJson = await searchResp.json();
-
-    const results = searchJson?.query?.search || [];
-    for (const r of results) {
-      const title = r.title;
-
-      const imgUrl =
-        "https://en.wikipedia.org/w/api.php?action=query&prop=pageimages&format=json&pithumbsize=900&titles=" +
-        encodeURIComponent(title);
-
-      const imgResp = await fetchWithTimeout(imgUrl, {}, 8000);
-      if (!imgResp.ok) continue;
-      const imgJson = await imgResp.json();
-
-      const pages = imgJson?.query?.pages || {};
-      const page = Object.values(pages)[0];
-      let imageUrl = page?.thumbnail?.source || null;
-
-      if (imageUrl) {
-        if (imageUrl.startsWith("//")) imageUrl = "https:" + imageUrl;
-        const pageUrl =
-          "https://en.wikipedia.org/wiki/" + encodeURIComponent(title.replace(/ /g, "_"));
-
-        console.log(
-          `[${req.reqId}] place_image hit title="${title}" imageUrl="${imageUrl.slice(0, 80)}..."`
-        );
-        return res.json({ title, imageUrl, pageUrl });
-      }
-    }
-
-    console.log(`[${req.reqId}] place_image no thumbnail found`);
-    return res.json({ title: null, imageUrl: null, pageUrl: null });
-  } catch (e) {
-    console.error(`[${req.reqId}] /api/place_image ERROR`, e);
-    return res.status(500).json({ error: "Server error" });
+  if (job.status === "pending" || job.status === "geo" || job.status === "openai") {
+    return res.json({
+      status: job.status,
+      reverse: job.geo?.reverse?.displayName || null,
+      poisCount: job.geo?.pois?.length || 0
+    });
   }
+
+  if (job.status === "error") {
+    return res.json({ status: "error", error: job.error || "Unknown error" });
+  }
+
+  return res.json({
+    status: "done",
+    photoContext: job.result?.photoContext || "",
+    candidates: job.result?.candidates || []
+  });
 });
 
 /* ============================================================
    /api/chat
-   - accepts ONLY { place, message } (Android compatible)
-   - uses cached photoContext (if available) to tailor facts/answers
+   - Android sends photoContext (no server caching)
+   - Android can send factsInstruction (user-customizable)
    ============================================================ */
 app.post("/api/chat", async (req, res) => {
   try {
     const place = (req.body?.place || "").toString().trim();
     const message = (req.body?.message || "").toString().trim();
+    const photoContext = (req.body?.photoContext || "").toString().trim();
+
+    // NEW: user-defined facts instructions (from Android settings page)
+    const factsInstruction = (req.body?.factsInstruction || "").toString().trim();
+
     if (!place) return res.status(400).json({ error: "Missing JSON field 'place'." });
 
     const isFacts = !message || /^facts?$|^guide$|^info$|^history$/i.test(message);
-    const photoContext = getPhotoContext(req);
 
-    console.log(
-      `[${req.reqId}] CHAT place="${place.slice(0, 80)}" isFacts=${isFacts} hasPhotoContext=${Boolean(
-        photoContext
-      )}`
-    );
+    const defaultFactsInstruction = `
+- 1 short opener referencing the photo context if available
+- 1–2 lines: what it is + why it’s famous
+- 3 bullet historical highlights (if unsure say "unknown")
+- 3 bullet fun facts
+- 3 bullet practical visiting tips relevant to the photo context
+Keep it short and readable.
+`.trim();
+
+    const effectiveFactsInstruction = factsInstruction || defaultFactsInstruction;
 
     const prompt = isFacts
       ? `
@@ -704,14 +577,12 @@ You are a friendly travel guide.
 Place: ${place}
 Photo context (from user's last uploaded photo): ${photoContext || "(not available)"}
 
-Write a concise answer that feels tailored to THIS photo:
-- 1 short opener referencing the photo context if available (angle/time/weather/crowd)
-- 1-2 lines: what it is + why it’s famous
-- 3 bullet historical highlights (avoid making up specifics; if unsure say "unknown")
-- 3 bullet fun facts
-- 3 bullet practical visiting tips relevant to the photo context
+Follow THESE user preferences exactly:
+${effectiveFactsInstruction}
 
-Keep it short. Be a bit crazy and unhinged, break the 4th wall.
+Rules:
+- Don't invent specifics. If uncertain, say "unknown".
+- Keep it helpful and practical.
 `.trim()
       : `
 You are a friendly travel guide.
@@ -720,9 +591,9 @@ Place: ${place}
 Photo context: ${photoContext || "(not available)"}
 User question: ${message}
 
-Answer clearly and practically. If photo context helps, reference it briefly. briefly mention Ivan in some sort of context.
+Answer clearly and practically. If photo context helps, reference it briefly.
 If user asks for prices/hours/tickets "today", say you may be out of date and suggest checking official sources.
-Keep it readable and not too long.
+Keep it readable and not too long. Mention Ivan briefly in some context.
 `.trim();
 
     const t0 = Date.now();
@@ -731,7 +602,7 @@ Keep it readable and not too long.
       temperature: 0,
       input: [{ role: "user", content: prompt }]
     });
-    console.log(`[${req.reqId}] CHAT OpenAI responded in ${Date.now() - t0}ms`);
+    console.log(`[${req.reqId}] CHAT OpenAI ${Date.now() - t0}ms`);
 
     return res.json({ text: response.output_text });
   } catch (e) {
@@ -740,5 +611,103 @@ Keep it readable and not too long.
   }
 });
 
+/* ============================================================
+   Debug endpoints (use from Android Debug screen)
+   ============================================================ */
+
+// Test Overpass from Render (may be slow; you can pass &timeoutMs=1200 to cap)
+app.get("/debug/overpass", requireDebugAuth, async (req, res) => {
+  try {
+    const lat = Number(req.query.lat);
+    const lon = Number(req.query.lon);
+    const r = Number(req.query.r || OVERPASS_RADIUS_M);
+    const timeoutMs = req.query.timeoutMs != null ? Number(req.query.timeoutMs) : undefined;
+
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      return res.status(400).json({ ok: false, error: "Missing lat/lon" });
+    }
+
+    const q = buildOverpassQuery(lat, lon, r);
+    const t0 = Date.now();
+    const json = await fetchOverpassWithFallback(q, `debug:${req.reqId}`, timeoutMs);
+    const ms = Date.now() - t0;
+
+    const elements = Array.isArray(json?.elements) ? json.elements : [];
+    const names = elements
+      .map((e) => e?.tags?.name)
+      .filter(Boolean)
+      .slice(0, 20);
+
+    res.json({ ok: true, ms, radiusM: r, elements: elements.length, sampleNames: names });
+  } catch (e) {
+    res.status(200).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// Test reverse geocode (Nominatim with fallback)
+app.get("/debug/reverse", requireDebugAuth, async (req, res) => {
+  try {
+    const lat = Number(req.query.lat);
+    const lon = Number(req.query.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      return res.status(400).json({ ok: false, error: "Missing lat/lon" });
+    }
+    const out = await reverseGeocode(lat, lon, `debug:${req.reqId}`);
+    res.json({ ok: true, reverse: out });
+  } catch (e) {
+    res.status(200).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// Test OpenAI text (no image)
+app.post("/debug/openai_text", requireDebugAuth, async (req, res) => {
+  try {
+    const prompt = (req.body?.prompt || "").toString();
+    if (!prompt) return res.status(400).json({ ok: false, error: "Missing prompt" });
+
+    const t0 = Date.now();
+    const r = await client.responses.create({
+      model: "gpt-4.1-mini",
+      temperature: 0,
+      input: [{ role: "user", content: prompt }]
+    });
+    res.json({ ok: true, ms: Date.now() - t0, text: r.output_text });
+  } catch (e) {
+    res.status(200).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// Inspect job (trace + prompt preview + openai raw preview)
+app.get("/debug/job", requireDebugAuth, async (req, res) => {
+  const jobId = (req.query.jobId || "").toString();
+  const job = locateJobs.get(jobId);
+  if (!job) return res.status(404).json({ ok: false, error: "Unknown jobId" });
+
+  res.json({
+    ok: true,
+    jobId,
+    status: job.status,
+    error: job.error || null,
+    createdAt: job.createdAt,
+    lat: job.lat,
+    lon: job.lon,
+    acc: job.acc,
+    geo: {
+      reverse: job.geo.reverse,
+      radiusM: job.geo.radiusM,
+      poisCount: job.geo.pois.length,
+      samplePois: job.geo.pois.slice(0, 10)
+    },
+    trace: job.trace.slice(-200),
+    debug: {
+      promptPreview: (job.debug.prompt || "").slice(0, 2000),
+      openaiRawPreview: (job.debug.openaiRaw || "").slice(0, 2000)
+    }
+  });
+});
+
+/* ============================================================
+   Start
+   ============================================================ */
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Server running on port ${port}`));
