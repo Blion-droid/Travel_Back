@@ -106,7 +106,7 @@ const OVERPASS_RADIUS_M = Number(process.env.OVERPASS_RADIUS_M || 1500);
 
 // IMPORTANT: set this on Render as env var to be polite to OSM services
 // e.g. OSM_CONTACT_EMAIL=your-real-email@domain.com
-const OSM_CONTACT = process.env.OSM_CONTACT_EMAIL || "ivan.leva040@gmai.com";
+const OSM_CONTACT = process.env.OSM_CONTACT_EMAIL;
 const OSM_UA = `travel-locate-server/1.0 (contact: ${OSM_CONTACT})`;
 
 // Overpass endpoints (first is primary, others are fallback)
