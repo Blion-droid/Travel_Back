@@ -357,7 +357,7 @@ ${
 
 CRITICAL RULES:
 - Prefer real named places close to the provided coordinates.
-- Use the nearby-places list as strong evidence, but you may choose outside it if the photo clearly suggests something else.;
+- Use the nearby-places list as strong evidence, but you may choose outside it if the photo clearly suggests something else.`;
 
     const schema = {
       type: "object",
@@ -407,7 +407,6 @@ ${job.userText ? job.userText : "(none)"}
 Rules:
 - Don't invent certainty.
 - If photo contradicts coords, mention it in "why" and lower confidence.
-- If nearby list non-empty, pick ONLY from it unless "coordinate conflict" (confidence <= 0.2).
 `.trim();
 
     job.debug.prompt = prompt;
