@@ -356,8 +356,8 @@ ${
 }
 
 CRITICAL RULES:
-- Prefer real named places close to the provided coordinates.
-- Use the nearby-places list as strong evidence, but you may choose outside it if the photo clearly suggests something else.`;
+- Use real named places close to the provided coordinates as a helping tool.
+- Use the nearby-places list as strong evidence, but you may choose outside it if the photo suggests something else.`;
 
     const schema = {
       type: "object",
@@ -394,7 +394,7 @@ Do NOT name/guess the place in this section.
 Task B — IDENTIFY PLACE:
 Return EXACTLY 3 candidates ranked best -> worst.
 For each candidate:
-- name: short friendly place name WITH city/country if possible
+- name: short friendly place name with city/country if possible
 - why: 1–2 sentences referencing visual cues AND how coordinates + nearby list affected the choice
 - confidence: 0..1
 - searchQuery: likely query to find a representative image
@@ -405,7 +405,7 @@ User request text:
 ${job.userText ? job.userText : "(none)"}
 
 Rules:
-- Don't invent certainty.
+- Don't invent certainty, if image unrecognisable tell so.
 - If photo contradicts coords, mention it in "why" and lower confidence.
 `.trim();
 
