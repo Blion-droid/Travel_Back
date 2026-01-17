@@ -357,7 +357,8 @@ ${
 
 CRITICAL RULES:
 - Use real named places close to the provided coordinates as a helping tool.
-- Use the nearby-places list as strong evidence, but you may choose outside it if the photo suggests something else.`;
+- Use the nearby-places list as strong evidence, but you may choose outside it if the photo suggests something else.
+- Priority should be as following from strongest to weakest: Photo, Location, Nearby-places`;
 
     const schema = {
       type: "object",
@@ -405,7 +406,7 @@ User request text:
 ${job.userText ? job.userText : "(none)"}
 
 Rules:
-- Don't invent certainty, if image unrecognisable tell so.
+- Don't invent certainty, if image is unrecognisable tell so.
 - If photo contradicts coords, mention it in "why" and lower confidence.
 `.trim();
 
