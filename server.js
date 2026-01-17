@@ -356,9 +356,8 @@ ${
 }
 
 CRITICAL RULES:
-- If a nearby-places list is provided and is not empty, you are encouraged to choose the 3 candidates from the list, its there to help you.
-- Use everything provided, Location, nearby-places, and photo context to come up with the answer.
-- Only choose outside the list and location if the PHOTO CLEARLY contradicts the coordinates; if so include "coordinate conflict" and set confidence <= 0.2.`;
+- Prefer real named places close to the provided coordinates.
+- Use the nearby-places list as strong evidence, but you may choose outside it if the photo clearly suggests something else.
 
     const schema = {
       type: "object",
