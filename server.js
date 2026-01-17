@@ -357,7 +357,7 @@ ${
 
 CRITICAL RULES:
 - Prefer real named places close to the provided coordinates.
-- Use the nearby-places list as strong evidence, but you may choose outside it if the photo clearly suggests something else.
+- Use the nearby-places list as strong evidence, but you may choose outside it if the photo clearly suggests something else.;
 
     const schema = {
       type: "object",
