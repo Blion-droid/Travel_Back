@@ -604,4 +604,111 @@ app.get("/api/place_image", async (req, res) => {
     console.log(`[${req.reqId}] place_image q="${query.slice(0, 120)}"`);
 
     const searchUrl =
-      "https://en.wiki
+      "https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit=8&srsearch=" +
+      encodeURIComponent(query);
+
+    const searchResp = await fetchWithTimeout(searchUrl, {}, 8000);
+    if (!searchResp.ok) return res.status(502).json({ error: "Wikipedia search failed" });
+    const searchJson = await searchResp.json();
+
+    const results = searchJson?.query?.search || [];
+    for (const r of results) {
+      const title = r.title;
+
+      const imgUrl =
+        "https://en.wikipedia.org/w/api.php?action=query&prop=pageimages&format=json&pithumbsize=900&titles=" +
+        encodeURIComponent(title);
+
+      const imgResp = await fetchWithTimeout(imgUrl, {}, 8000);
+      if (!imgResp.ok) continue;
+      const imgJson = await imgResp.json();
+
+      const pages = imgJson?.query?.pages || {};
+      const page = Object.values(pages)[0];
+      let imageUrl = page?.thumbnail?.source || null;
+
+      if (imageUrl) {
+        if (imageUrl.startsWith("//")) imageUrl = "https:" + imageUrl;
+        const pageUrl =
+          "https://en.wikipedia.org/wiki/" + encodeURIComponent(title.replace(/ /g, "_"));
+
+        console.log(
+          `[${req.reqId}] place_image hit title="${title}" imageUrl="${imageUrl.slice(0, 80)}..."`
+        );
+        return res.json({ title, imageUrl, pageUrl });
+      }
+    }
+
+    console.log(`[${req.reqId}] place_image no thumbnail found`);
+    return res.json({ title: null, imageUrl: null, pageUrl: null });
+  } catch (e) {
+    console.error(`[${req.reqId}] /api/place_image ERROR`, e);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+/* ============================================================
+   /api/chat
+   - accepts ONLY { place, message } (Android compatible)
+   - uses cached photoContext (if available) to tailor facts/answers
+   ============================================================ */
+app.post("/api/chat", async (req, res) => {
+  try {
+    const place = (req.body?.place || "").toString().trim();
+    const message = (req.body?.message || "").toString().trim();
+    if (!place) return res.status(400).json({ error: "Missing JSON field 'place'." });
+
+    const isFacts = !message || /^facts?$|^guide$|^info$|^history$/i.test(message);
+    const photoContext = getPhotoContext(req);
+
+    console.log(
+      `[${req.reqId}] CHAT place="${place.slice(0, 80)}" isFacts=${isFacts} hasPhotoContext=${Boolean(
+        photoContext
+      )}`
+    );
+
+    const prompt = isFacts
+      ? `
+You are a friendly travel guide.
+
+Place: ${place}
+Photo context (from user's last uploaded photo): ${photoContext || "(not available)"}
+
+Write a concise answer that feels tailored to THIS photo:
+- 1 short opener referencing the photo context if available (angle/time/weather/crowd)
+- 1-2 lines: what it is + why it’s famous
+- 3 bullet historical highlights (avoid making up specifics; if unsure say "unknown")
+- 3 bullet fun facts
+- 3 bullet practical visiting tips relevant to the photo context
+
+Keep it short. Be a bit crazy and unhinged, break the 4th wall.
+`.trim()
+      : `
+You are a friendly travel guide.
+
+Place: ${place}
+Photo context: ${photoContext || "(not available)"}
+User question: ${message}
+
+Answer clearly and practically. If photo context helps, reference it briefly. briefly mention Ivan in some sort of context.
+If user asks for prices/hours/tickets "today", say you may be out of date and suggest checking official sources.
+Keep it readable and not too long.
+`.trim();
+
+    const t0 = Date.now();
+    const response = await client.responses.create({
+      model: "gpt-4.1-mini",
+      temperature: 0,
+      input: [{ role: "user", content: prompt }]
+    });
+    console.log(`[${req.reqId}] CHAT OpenAI responded in ${Date.now() - t0}ms`);
+
+    return res.json({ text: response.output_text });
+  } catch (e) {
+    console.error(`[${req.reqId}] /api/chat ERROR`, e);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log(`Server running on port ${port}`));
