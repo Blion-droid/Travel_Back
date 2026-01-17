@@ -350,6 +350,36 @@ setInterval(() => {
   }
 }, 60_000);
 
+
+app.get("/debug/overpass", async (req, res) => {
+  const lat = Number(req.query.lat);
+  const lon = Number(req.query.lon);
+  const r = Number(req.query.r || 800);
+
+  const q = buildOverpassQuery(lat, lon, r);
+
+  try {
+    const resp = await fetch("https://overpass-api.de/api/interpreter", {
+      method: "POST",
+      headers: {
+        "Content-Type": "text/plain",
+        "User-Agent": OSM_UA
+      },
+      body: q
+    });
+
+    const text = await resp.text();
+    res.status(200).json({
+      ok: resp.ok,
+      status: resp.status,
+      statusText: resp.statusText,
+      bodyPreview: text.slice(0, 300)
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
 /* ============================================================
    /api/locate
    - Generates photoContext + candidates
