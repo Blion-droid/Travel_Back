@@ -413,8 +413,8 @@ Rules:
     job.debug.prompt = prompt;
 
     const response = await client.responses.create({
-      model: "gpt-4.1-mini",
-      temperature: 0,
+      model: "gpt-5-mini",
+      temperature: 0.4,
       input: [
         {
           role: "user",
