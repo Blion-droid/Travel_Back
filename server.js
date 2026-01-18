@@ -414,7 +414,6 @@ Rules:
 
     const response = await client.responses.create({
       model: "gpt-5-mini",
-      temperature: 0.4,
       input: [
         {
           role: "user",
